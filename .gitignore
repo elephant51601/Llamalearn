@@ -1,4 +1,6 @@
-build/
+build/*
+!build/run.py
+
 cmake-build-*/
 *.o
 *.obj
@@ -24,4 +26,3 @@ cmake-build-*/
 # 日志
 *.log
 
-! build/run.py
