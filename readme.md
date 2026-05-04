@@ -10,6 +10,7 @@ v1.0跑通后，引入NVIDIA Nsight工具链进行性能优化，实现算子重
 #### 优化点1：显存预分配
 - **瓶颈定位**：使用`nsys`分析发现，Kernel计算时间占比少，cudaMalloc/cudaMemcpy/cudaFree占据90%以上时间
 - **优化过程**：引擎初始化阶段进行显存预分配；引入mmap减少拷贝时间
+
 优化前：
 ![alt text](images/优化1.png)
 优化后：
