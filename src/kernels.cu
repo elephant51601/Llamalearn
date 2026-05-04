@@ -27,42 +27,77 @@ void launch_add(float* d_a, float* d_b, int size) {
 
 // 3. 矩阵乘法
 __global__ void matmul_kernel(float* out, float* x, float* weight, int m, int n) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < m) {
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += weight[row * n + j] * x[j];
-        }
-        out[row] = val;
+    int row = blockIdx.x;
+    int c = threadIdx.x;
+    
+    float val = 0.0f;
+    for (int j = c; j < n; j+=blockDim.x) {
+        val += weight[row * n + j] * x[j];
     }
+    
+    // 此时val是每个线程自己的和，要全部相加
+    // 把每个线程算的部分和写到共享内存
+    __shared__ float sdata[256];
+    sdata[c] = val;
+    __syncthreads();
+
+    // 规约求和
+    // for (int s = 1; s < blockDim.x; s *= 2) {
+    //     if (c % (2 * s) == 0) {
+    //         sdata[c] += sdata[c + s];
+    //     }
+    //     __syncthreads();
+    // }
+
+    for(int s = blockDim.x / 2; s>0; s >>= 1){
+        if(c < s){
+            sdata[c] += sdata[c + s];
+        }
+        __syncthreads();
+    }
+
+    if (c == 0) {
+        out[row] = sdata[0];
+    }
+    
 }
 void launch_matmul(float* d_out, float* d_x, float* d_weight, int m, int n) {
-    int blocks = (m + 255) / 256;
-    matmul_kernel<<<blocks, 256>>>(d_out, d_x, d_weight, m, n);
+    matmul_kernel<<<m, 256>>>(d_out, d_x, d_weight, m, n);
 }
 
 // 4. RMSNorm
 __global__ void rmsnorm_kernel(float* out, float* x, float* weight, int size) {
-    // 目前是单线程求和
-    __shared__ float ss;
-    if (threadIdx.x == 0) {
-        float sum = 0.0f;
-        for (int i = 0; i < size; i++) {
-            sum += x[i] * x[i];
-        }
-        sum = sum / size + 1e-5f;
-        ss = 1.0f / sqrtf(sum);
+    
+    int tid = threadIdx.x;
+
+    __shared__ float s_sum[256];
+    __shared__ float sum;
+    
+    float local_sum = 0.0f;
+    for(int t=tid; t<size; t+= blockDim.x){
+        local_sum += x[t] * x[t];
     }
+    s_sum[tid] = local_sum;
     __syncthreads();
     
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < size) {
-        out[i] = weight[i] * x[i] * ss;
+    for(int s=blockDim.x / 2;s > 0;s >>= 1){
+        if(tid < s){
+            s_sum[tid] += s_sum[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if(tid == 0)
+        sum = 1.0f / sqrtf(s_sum[0] / size + 1e-5f);
+    __syncthreads();
+    
+    for(int t=tid; t<size; t+= blockDim.x){
+        out[t] = weight[t] * x[t] * sum;
     }
 }
 void launch_rmsnorm(float* d_out, float* d_x, float* d_weight, int size) {
-    int blocks = (size + 255) / 256;
-    rmsnorm_kernel<<<blocks, 256>>>(d_out, d_x, d_weight, size);
+    // int blocks = (size + 255) / 256;
+    rmsnorm_kernel<<<1, 256>>>(d_out, d_x, d_weight, size);
 }
 
 // 5. SwiGLU 激活
@@ -125,11 +160,12 @@ void launch_cache_update(float* d_key_cache, float* d_value_cache, float* d_k, f
 }
 
 
-// 8. GQA 注意力机制 (单Block处理单个Head)
+// 8. GQA 注意力机制
 __global__ void attention_kernel(float* xb, float* q, float* key_cache, float* value_cache, float* att, 
                                  int kv_cache_offset, int pos, int seq_len, int n_head_q, int q_pergroup, int head_size, int kv_dim) {
-    // 让每个 Block 负责一个 Query Head
+    // 让每个 Block 负责一个 Q
     int h = blockIdx.x; 
+    int tid = threadIdx.x;
     if (h >= n_head_q) return;
     
     int group = h / q_pergroup;
@@ -137,38 +173,107 @@ __global__ void attention_kernel(float* xb, float* q, float* key_cache, float* v
     float* my_att = att + h * seq_len;
     float* my_xb = xb + h * head_size;
     
-    // 计算att
-    for (int t = 0; t <= pos; t++) {
+   
+    for(int t=tid; t<pos; t+= blockDim.x){
         float* my_k = key_cache + kv_cache_offset + t * kv_dim + group * head_size;
+
+        // 直接算完整点积
         float score = 0.0f;
         for (int i = 0; i < head_size; i++) {
             score += my_q[i] * my_k[i];
         }
+
         my_att[t] = score / sqrtf((float)head_size);
+        
     }
+    __syncthreads();
+
+    // int warp_id = tid / 32;    // 哪个warp
+    // int lane_id = tid % 32;    // warp内编号 0~31
+
+    // int num_warp = blockDim.x / 32;  // 一个block 8个warp
+    // int t_start = warp_id;
+
+    // // 一个 warp 处理一个 t
+    // for (int t = t_start; t <= pos; t += num_warp)
+    // {
+    //     float* k = key_cache + kv_cache_offset + t * kv_dim + group * head_size;
+
+    //     // warp 内并行点积
+    //     float sum = 0.0f;
+    //     for (int i = lane_id; i < head_size; i += 32) {
+    //         sum += my_q[i] * k[i];
+    //     }
+
+    //     // warp 内规约
+    //     for (int s = 1; s < 32; s *= 2) {
+    //         sum += __shfl_down_sync(0xffffffff, sum, s);
+    //     }
+
+    //     // lane 0 写结果
+    //     if (lane_id == 0) {
+    //         my_att[t] = sum / sqrtf((float)head_size);
+    //     }
+    // }
+    // __syncthreads();
+
 
     // Softmax
-    float max_val = my_att[0];
-    for (int t = 1; t <= pos; t++) {
-        if (my_att[t] > max_val) max_val = my_att[t];
+    
+    __shared__ float s_max[256];
+    __shared__ float s_sum[256];
+
+    float local_max = -1e9;  
+    for (int t = tid; t <= pos; t += blockDim.x) {
+        local_max = fmaxf(local_max, my_att[t]);
     }
-    float sum = 0.0f;
-    for (int t = 0; t <= pos; t++) {
-        my_att[t] = expf(my_att[t] - max_val);
-        sum += my_att[t];
+    s_max[tid] = local_max;
+    __syncthreads();
+    
+    // 规约求最大值
+    
+    for(int s = blockDim.x / 2; s > 0; s>>= 1){
+        if(tid<s){
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + s]);
+        }
+        __syncthreads();
     }
-    for (int t = 0; t <= pos; t++) {
-        my_att[t] /= sum;
+    
+    float local_sum = 0.0f;
+    for (int t = tid; t <= pos; t += blockDim.x) {
+        my_att[t] = expf(my_att[t] - s_max[0]);
+        local_sum += my_att[t];
+    }
+    s_sum[tid] = local_sum;
+    __syncthreads();
+
+    for(int s = blockDim.x / 2; s > 0; s>>= 1){
+        if(tid < s){
+            s_sum[tid] += s_sum[tid + s];
+        }
+        __syncthreads();
     }
 
+    for(int t = tid; t<=pos; t+=blockDim.x){
+        my_att[t] /= s_sum[0];
+    }
+    __syncthreads();
+
     // 加权求和v
-    for (int i = 0; i < head_size; i++) my_xb[i] = 0.0f;
-    for (int t = 0; t <= pos; t++) {
-        float* my_v = value_cache + kv_cache_offset + t * kv_dim + group * head_size;
-        float a = my_att[t];
-        for (int i = 0; i < head_size; i++) {
-            my_xb[i] += a * my_v[i];
+    for (int i = tid; i < head_size; i+=blockDim.x){
+        my_xb[i] = 0.0f;
+    } 
+    __syncthreads();
+   
+
+    for(int i = tid;i < head_size;i++){
+        float val = 0.0f;
+        for(int t = 0; t<= pos; t++){
+            float* my_v = value_cache + kv_cache_offset + t*kv_dim + group * head_size;
+            float a = my_att[t];
+            val += a * my_v[i];
         }
+        my_xb[i] = val;
     }
 }
 void launch_attention(float* d_xb, float* d_q, float* d_key_cache, float* d_value_cache, float* d_attention, 
@@ -176,6 +281,6 @@ void launch_attention(float* d_xb, float* d_q, float* d_key_cache, float* d_valu
     int kv_cache_offset = layer * seq_len * kv_dim;
     int q_pergroup = n_head_q / n_head_kv;
     // 分配 n_head_q 个线程块，每个块处理一个头
-    attention_kernel<<<n_head_q, 1>>>(d_xb, d_q, d_key_cache, d_value_cache, d_attention, 
+    attention_kernel<<<n_head_q, 256>>>(d_xb, d_q, d_key_cache, d_value_cache, d_attention, 
                                       kv_cache_offset, pos, seq_len, n_head_q, q_pergroup, head_size, kv_dim);
 }

@@ -8,7 +8,10 @@ model = llm_engine.Transformer(model_path)
 
 
 print("Loading Tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+tokenizer = AutoTokenizer.from_pretrained(
+    "./tinyllama_tokenizer",    
+    local_files_only=True       
+)
 
 
 prompt = "Once upon a time, there was a little dog"
@@ -17,7 +20,7 @@ input_ids = tokenizer.encode(prompt)
 
 print("Prompt:", prompt, end="")
 
-max_new_tokens = 100
+max_new_tokens = 256
 temperature = 1
 top_p = 0.9
 

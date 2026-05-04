@@ -101,7 +101,7 @@ Transformer::Transformer(const char* model_path){
 
     // std::cout << this->config.layers << std::endl;
 
-    // 1. 读取头文件获取 Config
+    // 读取头文件获取 Config
     FILE *file = fopen(model_path, "rb");
     int header[256 / sizeof(int)] = {0};
     fread(header, sizeof(int), 256 / sizeof(int), file);
@@ -115,13 +115,13 @@ Transformer::Transformer(const char* model_path){
     this->config.vocabulary_size = abs(header[5]);
     this->config.seq_len = header[6];
 
-    // 2. CPU mmap 映射文件读取权重
+    // CPU mmap 映射文件读取权重
     int fd = open(model_path, O_RDONLY);
     size_t file_size = lseek(fd, 0, SEEK_END);
     void* mapped_data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     float* cpu_weights_start = static_cast<float*>(mapped_data) + (256 / sizeof(float));
 
-    // 3. GPU 显存常驻分配
+    // GPU 显存常驻分配
     size_t weights_bytes = file_size - 256;
     cudaMalloc((void**)&this->device_weights_memory, weights_bytes);
     
@@ -131,7 +131,7 @@ Transformer::Transformer(const char* model_path){
     munmap(mapped_data, file_size);
     close(fd);
 
-    // 4. 计算各个矩阵在 GPU 显存中的偏移量
+    // 计算各个矩阵在 GPU 显存中的偏移量
     float* d_ptr = this->device_weights_memory;
     this->weights.token_embedding_table = d_ptr; d_ptr += config.vocabulary_size * config.dim;
     this->weights.rms_att_weight = d_ptr;        d_ptr += config.layers * config.dim;
@@ -149,7 +149,7 @@ Transformer::Transformer(const char* model_path){
     if (header[5] > 0) this->weights.wcls = this->weights.token_embedding_table;
     else this->weights.wcls = d_ptr;
 
-    // 5. 激活动态显存常驻
+    // 激活动态显存常驻
     int kv_dim = (config.dim * config.n_head_kv) / config.n_head_q;
     size_t run_mem_size = 0;
     run_mem_size += config.dim * 3; // x, xb, xb2
